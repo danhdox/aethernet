@@ -1,0 +1,28 @@
+{
+  "name": "@aethernet/local-api",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@aethernet/core-runtime": "workspace:*",
+    "@aethernet/protocol-auth": "workspace:*",
+    "@aethernet/protocol-identity": "workspace:*",
+    "@aethernet/protocol-payments": "workspace:*",
+    "@aethernet/shared-types": "workspace:*",
+    "express": "^4.21.2",
+    "viem": "^2.44.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21"
+  }
+}

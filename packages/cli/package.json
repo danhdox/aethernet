@@ -1,0 +1,23 @@
+{
+  "name": "@aethernet/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "aethernet": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@aethernet/core-runtime": "workspace:*",
+    "@aethernet/local-api": "workspace:*",
+    "@aethernet/provider-interface": "workspace:*",
+    "@aethernet/protocol-identity": "workspace:*",
+    "@aethernet/protocol-messaging": "workspace:*",
+    "@aethernet/protocol-payments": "workspace:*",
+    "@aethernet/shared-types": "workspace:*",
+    "viem": "^2.44.2"
+  }
+}
