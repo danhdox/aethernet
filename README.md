@@ -4,6 +4,20 @@
 
 Aethernet is a wallet-centric autonomous AI agent runtime with full Web3 integration. Agents can generate their own wallets, register via ERC-8004, authenticate using agent-native signing, communicate over XMTP, and accept x402 payment-gated jobs.
 
+## 🚀 Quick Start
+
+**New to Aethernet?** Check out the [Quick Start Guide](./QUICKSTART.md) to get running in 5 minutes!
+
+```bash
+npm install && npm run build && npm test
+```
+
+## 📚 Documentation
+
+- **[Quick Start Guide](./QUICKSTART.md)** - Get up and running in 5 minutes
+- **[Architecture Guide](./ARCHITECTURE.md)** - Deep dive into the system design
+- **[Security Documentation](./SECURITY.md)** - Security considerations and best practices
+
 ## Features
 
 - 🔑 **Identity Layer**: Automatic wallet generation and ERC-8004 agent registration
