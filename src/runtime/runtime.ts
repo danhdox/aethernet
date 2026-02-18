@@ -26,6 +26,7 @@ export class AgentRuntime {
   private isRunning: boolean = false;
   private config: AgentConfig;
   private survivalCheckInterval: NodeJS.Timeout | null = null;
+  private survivalCheckInProgress: boolean = false;
 
   constructor(config: AgentConfig) {
     this.config = config;
@@ -294,6 +295,10 @@ export class AgentRuntime {
   private startSurvivalLogic(): void {
     // Check balance and reputation periodically
     this.survivalCheckInterval = setInterval(async () => {
+      // Skip if a check is already in progress
+      if (this.survivalCheckInProgress) {
+        return;
+      }
       await this.survivalCheck();
     }, 60000); // Every minute
   }
@@ -302,26 +307,41 @@ export class AgentRuntime {
    * Perform survival check
    */
   private async survivalCheck(): Promise<void> {
-    const balance = await this.payments.getBalance();
-    const reputation = this.reputation.getScore();
+    this.survivalCheckInProgress = true;
+    
+    try {
+      const balance = await this.payments.getBalance();
+      const reputation = this.reputation.getScore();
 
-    console.log(`Survival Check - Balance: ${balance}, Reputation: ${reputation.score}`);
+      console.log(`Survival Check - Balance: ${balance}, Reputation: ${reputation.score}`);
 
-    // Check if balance is critically low
-    if (balance < BigInt(10000)) {
-      console.warn('⚠️  Low balance warning! Agent may need funding.');
-    }
+      // Check if balance is critically low
+      if (balance < BigInt(10000)) {
+        console.warn('⚠️  Low balance warning! Agent may need funding.');
+      }
 
-    // Check reputation
-    if (reputation.score < 40) {
-      console.warn('⚠️  Low reputation warning! Agent performance needs improvement.');
-    }
+      // Check reputation
+      if (reputation.score < 40) {
+        console.warn('⚠️  Low reputation warning! Agent performance needs improvement.');
+      }
 
-    // Survival strategy: adjust minimum payment based on balance
-    if (balance < BigInt(100000)) {
-      const newMinPayment = this.payments.getMinPayment() * BigInt(2);
-      this.payments.setMinPayment(newMinPayment);
-      console.log(`Increased minimum payment to ${newMinPayment} for survival`);
+      // Survival strategy: adjust minimum payment based on balance
+      // Cap at 100x the original minimum to prevent runaway pricing
+      if (balance < BigInt(100000)) {
+        const currentMin = this.payments.getMinPayment();
+        const originalMin = this.config.minJobPayment || BigInt(0);
+        const maxAllowed = originalMin * BigInt(100);
+        
+        const newMinPayment = currentMin * BigInt(2);
+        if (newMinPayment <= maxAllowed) {
+          this.payments.setMinPayment(newMinPayment);
+          console.log(`Increased minimum payment to ${newMinPayment} for survival`);
+        } else {
+          console.log(`Minimum payment already at maximum cap: ${maxAllowed}`);
+        }
+      }
+    } finally {
+      this.survivalCheckInProgress = false;
     }
   }
 

@@ -47,7 +47,7 @@ async function testCore() {
   
   const testJob: Job = {
     id: 'test-job-1',
-    sender: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
+    sender: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0',
     description: 'Test job',
     payment: BigInt(5000),
     status: 'completed',
@@ -75,7 +75,7 @@ async function testCore() {
   for (let i = 0; i < 5; i++) {
     const job: Job = {
       id: `job-${i}`,
-      sender: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb',
+      sender: '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0',
       description: `Job ${i}`,
       payment: BigInt(1000 * (i + 1)),
       status: 'completed',

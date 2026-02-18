@@ -24,14 +24,28 @@ export function sleep(ms: number): Promise<void> {
  * Format wei to ether
  */
 export function formatEther(wei: bigint): string {
-  return (Number(wei) / 1e18).toFixed(6);
+  // Convert bigint to string to avoid precision loss
+  const weiStr = wei.toString();
+  const len = weiStr.length;
+  
+  if (len <= 18) {
+    const padded = weiStr.padStart(18, '0');
+    return `0.${padded}`;
+  } else {
+    const integerPart = weiStr.slice(0, len - 18);
+    const decimalPart = weiStr.slice(len - 18);
+    return `${integerPart}.${decimalPart}`;
+  }
 }
 
 /**
  * Parse ether to wei
  */
 export function parseEther(ether: string): bigint {
-  return BigInt(Math.floor(parseFloat(ether) * 1e18));
+  const parts = ether.split('.');
+  const integerPart = parts[0] || '0';
+  const decimalPart = (parts[1] || '').padEnd(18, '0').slice(0, 18);
+  return BigInt(integerPart + decimalPart);
 }
 
 /**
