@@ -120,6 +120,8 @@ export async function startLocalApi(options: LocalApiOptions): Promise<LocalApiS
       children: options.runtime.db.listChildren(),
       providerEvents: options.runtime.db.listProviderEvents(50),
       incidents: options.runtime.db.listRuntimeIncidents(50),
+      alerts: options.runtime.db.listAlertEvents(50),
+      telemetry: options.runtime.db.listTurnTelemetry(50),
     });
   });
 
@@ -135,6 +137,64 @@ export async function startLocalApi(options: LocalApiOptions): Promise<LocalApiS
 
   app.get("/v1/agent/metrics", (_req, res) => {
     res.json(buildMetrics(options.runtime));
+  });
+
+  app.get("/v1/skills", protectRequest, (_req, res) => {
+    res.json({ skills: options.runtime.listSkills() });
+  });
+
+  app.get("/v1/tools/sources", protectRequest, (_req, res) => {
+    res.json({ sources: options.runtime.listToolSources() });
+  });
+
+  app.post("/v1/tools/invoke", protectRequest, async (req, res) => {
+    const sourceId = typeof req.body?.sourceId === "string" ? req.body.sourceId : "";
+    const toolName = typeof req.body?.toolName === "string" ? req.body.toolName : "";
+    const input = req.body?.input && typeof req.body.input === "object" ? req.body.input : {};
+    if (!sourceId || !toolName) {
+      res.status(400).json({ error: "sourceId and toolName are required" });
+      return;
+    }
+    const result = await options.runtime.invokeTool({
+      sourceId,
+      toolName,
+      input,
+    });
+    if (!result.ok) {
+      res.status(400).json(result);
+      return;
+    }
+    res.json(result);
+  });
+
+  app.post("/v1/skills/:id/enable", protectRequest, (req, res) => {
+    const skillId = req.params.id;
+    if (!skillId) {
+      res.status(400).json({ error: "skill id is required" });
+      return;
+    }
+    const result = options.runtime.setSkillEnabled(skillId, true);
+    res.json({ ok: true, ...result });
+  });
+
+  app.post("/v1/skills/:id/disable", protectRequest, (req, res) => {
+    const skillId = req.params.id;
+    if (!skillId) {
+      res.status(400).json({ error: "skill id is required" });
+      return;
+    }
+    const result = options.runtime.setSkillEnabled(skillId, false);
+    res.json({ ok: true, ...result });
+  });
+
+  app.get("/v1/memory/facts", protectRequest, (req, res) => {
+    const limit = Number(req.query.limit ?? 200);
+    res.json({ facts: options.runtime.listMemoryFacts(limit) });
+  });
+
+  app.get("/v1/memory/episodes", protectRequest, (req, res) => {
+    const limit = Number(req.query.limit ?? 200);
+    res.json({ episodes: options.runtime.listMemoryEpisodes(limit) });
   });
 
   app.get("/v1/agent/children", protectRequest, (_req, res) => {
@@ -479,17 +539,27 @@ export async function startLocalApi(options: LocalApiOptions): Promise<LocalApiS
 
   app.get("/v1/agent/alerts", protectRequest, (_req, res) => {
     const incidents = options.runtime.db.listRuntimeIncidents(200);
+    const alerts = options.runtime.db.listAlertEvents(200);
     const critical = incidents.filter((incident) => incident.severity === "critical");
     const warning = incidents.filter((incident) => incident.severity === "warning");
     const error = incidents.filter((incident) => incident.severity === "error");
+    const latestTelemetry = options.runtime.db.listTurnTelemetry(1)[0];
+    const status = options.runtime.status();
 
     res.json({
+      thresholds: options.runtime.config.alerting,
+      state: {
+        survivalTier: status.survivalTier,
+        queueDepth: options.runtime.db.countMessages(),
+        brainFailureStreak: latestTelemetry?.brainFailures ?? 0,
+      },
       counts: {
         total: incidents.length,
         critical: critical.length,
         warning: warning.length,
         error: error.length,
       },
+      alerts,
       incidents,
     });
   });
@@ -594,6 +664,14 @@ function buildMetrics(runtime: AethernetRuntime): AgentRuntimeMetrics {
   const health = runtime.db.health();
   const paymentEvents = runtime.db.listPaymentEvents(2000);
   const incidents = runtime.db.listRuntimeIncidents(2000);
+  const telemetry = runtime.db.listTurnTelemetry(2000);
+  const status = runtime.status();
+  const latestTelemetry = telemetry[0];
+  const totalActionFailures = telemetry.reduce((acc, item) => acc + item.actionFailures, 0);
+  const totalActions = telemetry.reduce((acc, item) => acc + item.actionsTotal, 0);
+  const totalBrainDuration = telemetry.reduce((acc, item) => acc + item.brainDurationMs, 0);
+  const avgBrainDuration = telemetry.length ? Math.round(totalBrainDuration / telemetry.length) : 0;
+  const maxBrainFailures = telemetry.reduce((acc, item) => Math.max(acc, item.brainFailures), 0);
 
   const counts = {
     children: {
@@ -625,6 +703,18 @@ function buildMetrics(runtime: AethernetRuntime): AgentRuntimeMetrics {
     turns: health.turnCount,
     messagesTotal: counts.messages.total,
     queuedMessages: counts.messages.queued,
+    lastSurvivalTier: status.survivalTier,
+    lastEstimatedUsd: status.estimatedUsd,
+    latestQueueDepth: latestTelemetry?.queueDepth ?? counts.messages.queued,
+    spendProxyUsd: latestTelemetry?.spendProxyUsd ?? status.estimatedUsd ?? 0,
+    brain: {
+      avgDurationMs: avgBrainDuration,
+      failures: maxBrainFailures,
+    },
+    actions: {
+      total: totalActions,
+      failed: totalActionFailures,
+    },
     paymentEvents: {
       total: counts.payments.inbound + counts.payments.outbound,
       inbound: counts.payments.inbound,

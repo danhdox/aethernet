@@ -21,7 +21,7 @@ import type {
 const execAsync = promisify(execCb);
 const execFileAsync = promisify(execFileCb);
 
-export interface ConwayProviderOptions {
+export interface ApiProviderOptions {
   apiUrl: string;
   apiKey: string;
   timeoutMs?: number;
@@ -41,13 +41,13 @@ export interface KubernetesProviderOptions {
   execTimeoutMs?: number;
 }
 
-export class ConwayComputeProvider implements ComputeProvider {
-  public readonly name = "conway";
+export class ApiComputeProvider implements ComputeProvider {
+  public readonly name = "api";
   private readonly apiUrl: string;
   private readonly apiKey: string;
   private readonly timeoutMs: number;
 
-  constructor(options: ConwayProviderOptions) {
+  constructor(options: ApiProviderOptions) {
     this.apiUrl = options.apiUrl.replace(/\/$/, "");
     this.apiKey = options.apiKey;
     this.timeoutMs = options.timeoutMs ?? 30_000;
@@ -170,7 +170,7 @@ export class ConwayComputeProvider implements ComputeProvider {
 
       if (!response.ok) {
         const body = await response.text();
-        throw new Error(`Conway API request failed (${response.status}): ${body}`);
+        throw new Error(`Provider API request failed (${response.status}): ${body}`);
       }
 
       if (response.status === 204) {

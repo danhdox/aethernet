@@ -1,10 +1,18 @@
 #!/usr/bin/env node
 
-import { AethernetRuntime, decryptWalletAccount, loadConfig, writeConfig } from "@aethernet/core-runtime";
+import fs from "node:fs";
+import {
+  AethernetRuntime,
+  createDefaultConfig,
+  decryptWalletAccount,
+  loadConfig,
+  validateConfigDiagnostics,
+  writeConfig,
+} from "@aethernet/core-runtime";
 import { startLocalApi } from "@aethernet/local-api";
 import {
   providerCapabilityMatrix,
-  ConwayComputeProvider,
+  ApiComputeProvider,
   KubernetesComputeProvider,
   InMemoryComputeProvider,
   SelfHostComputeProvider,
@@ -12,7 +20,8 @@ import {
 import { Erc8004Client, findChainProfile } from "@aethernet/protocol-identity";
 import { InMemoryMessagingTransport, XmtpMessagingTransport } from "@aethernet/protocol-messaging";
 import { x402Fetch } from "@aethernet/protocol-payments";
-import type { HexAddress } from "@aethernet/shared-types";
+import type { AgentConfig, HexAddress } from "@aethernet/shared-types";
+import { configNeedsOnboarding, runOnboarding } from "./onboarding.js";
 
 async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
@@ -51,6 +60,18 @@ async function main(): Promise<void> {
     case "msg":
       await handleMessage(rest);
       return;
+    case "skills":
+      await handleSkills(rest);
+      return;
+    case "memory":
+      await handleMemory(rest);
+      return;
+    case "tools":
+      await handleTools(rest);
+      return;
+    case "config":
+      await handleConfig(rest);
+      return;
     case "replicate":
       await handleReplicate(rest);
       return;
@@ -69,7 +90,25 @@ async function handleSetup(args: string[]): Promise<void> {
   if (args[0] && args[0] !== "wizard") {
     throw new Error(`Unknown setup subcommand: ${args[0]}`);
   }
-  await handleInit();
+  const defaults = createDefaultConfig();
+  const existing = fsExistsSafe(defaults.configPath) ? loadConfigOrDefault(defaults) : defaults;
+  const { config, walletImported, walletCreated } = await runOnboarding(existing);
+  console.log(
+    JSON.stringify(
+      {
+        ok: true,
+        action: "setup",
+        configPath: config.configPath,
+        chainDefault: config.chainDefault,
+        provider: config.providerName,
+        model: config.brain.model,
+        walletImported,
+        walletCreated,
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 async function handleInit(): Promise<void> {
@@ -109,7 +148,12 @@ async function handleRun(args: string[]): Promise<void> {
   const intervalMs = Number(getOption(args, "--interval-ms") ?? NaN);
   const prompt = getOption(args, "--prompt");
 
-  const config = loadConfig();
+  const defaultConfig = createDefaultConfig();
+  const config = configNeedsOnboarding(defaultConfig.configPath)
+    ? (await runOnboarding(
+      fsExistsSafe(defaultConfig.configPath) ? loadConfigOrDefault(defaultConfig) : defaultConfig,
+    )).config
+    : loadConfig();
   const provider = resolveProvider(config);
   const runtime = new AethernetRuntime(config, {
     provider,
@@ -462,6 +506,69 @@ async function handleMessage(args: string[]): Promise<void> {
   throw new Error(`Unknown msg subcommand: ${sub}`);
 }
 
+async function handleSkills(args: string[]): Promise<void> {
+  const sub = args[0] ?? "list";
+  const config = loadConfig();
+  const runtime = new AethernetRuntime(config, {
+    provider: resolveProvider(config),
+  });
+  runtime.initialize();
+
+  if (sub === "list") {
+    console.log(JSON.stringify({ skills: runtime.listSkills() }, null, 2));
+    runtime.close();
+    return;
+  }
+
+  if (sub === "enable") {
+    const id = args[1];
+    if (!id) {
+      throw new Error("Usage: aethernet skills enable <id>");
+    }
+    const updated = runtime.setSkillEnabled(id, true);
+    console.log(JSON.stringify({ ok: true, ...updated }, null, 2));
+    runtime.close();
+    return;
+  }
+
+  if (sub === "disable") {
+    const id = args[1];
+    if (!id) {
+      throw new Error("Usage: aethernet skills disable <id>");
+    }
+    const updated = runtime.setSkillEnabled(id, false);
+    console.log(JSON.stringify({ ok: true, ...updated }, null, 2));
+    runtime.close();
+    return;
+  }
+
+  runtime.close();
+  throw new Error(`Unknown skills subcommand: ${sub}`);
+}
+
+async function handleMemory(args: string[]): Promise<void> {
+  const sub = args[0];
+  const limit = Number(getOption(args, "--limit") ?? 200);
+  const config = loadConfig();
+  const runtime = new AethernetRuntime(config);
+  runtime.initialize();
+
+  if (sub === "facts") {
+    console.log(JSON.stringify({ facts: runtime.listMemoryFacts(limit) }, null, 2));
+    runtime.close();
+    return;
+  }
+
+  if (sub === "episodes") {
+    console.log(JSON.stringify({ episodes: runtime.listMemoryEpisodes(limit) }, null, 2));
+    runtime.close();
+    return;
+  }
+
+  runtime.close();
+  throw new Error("Usage: aethernet memory <facts|episodes> [--limit <n>]");
+}
+
 async function handleReplicate(args: string[]): Promise<void> {
   const sub = args[0];
   const config = loadConfig();
@@ -551,6 +658,65 @@ async function handleReplicate(args: string[]): Promise<void> {
   runtime.close();
 }
 
+async function handleTools(args: string[]): Promise<void> {
+  const sub = args[0] ?? "sources";
+  const config = loadConfig();
+  const runtime = new AethernetRuntime(config, {
+    provider: resolveProvider(config),
+    messaging: resolveMessagingTransport(config),
+  });
+  runtime.initialize();
+
+  if (sub === "sources" || sub === "list") {
+    console.log(JSON.stringify({ sources: runtime.listToolSources() }, null, 2));
+    runtime.close();
+    return;
+  }
+
+  if (sub === "invoke") {
+    const sourceId = getOption(args, "--source");
+    const toolName = getOption(args, "--tool");
+    if (!sourceId || !toolName) {
+      runtime.close();
+      throw new Error("Usage: aethernet tools invoke --source <id> --tool <name> [--input <json>]");
+    }
+    const inputRaw = getOption(args, "--input");
+    const parsedInput = inputRaw ? safeParseJson(inputRaw) : {};
+    const result = await runtime.invokeTool({
+      sourceId,
+      toolName,
+      input: parsedInput,
+    });
+    console.log(JSON.stringify(result, null, 2));
+    runtime.close();
+    return;
+  }
+
+  runtime.close();
+  throw new Error(`Unknown tools subcommand: ${sub}`);
+}
+
+async function handleConfig(args: string[]): Promise<void> {
+  const sub = args[0] ?? "validate";
+  if (sub !== "validate") {
+    throw new Error(`Unknown config subcommand: ${sub}`);
+  }
+
+  const config = loadConfig();
+  const diagnostics = validateConfigDiagnostics(config);
+  const errors = diagnostics.filter((item) => item.severity === "error");
+  console.log(
+    JSON.stringify(
+      {
+        ok: errors.length === 0,
+        diagnostics,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
 async function handleEmergencyClear(): Promise<void> {
   const config = loadConfig();
   const runtime = new AethernetRuntime(config);
@@ -570,15 +736,15 @@ async function handleEmergencyStop(args: string[]): Promise<void> {
   runtime.close();
 }
 
-function resolveProvider(config: ReturnType<typeof loadConfig>) {
-  const provider = (process.env.AETHERNET_PROVIDER ?? "").trim().toLowerCase();
-  if (provider === "conway" || (provider === "" && config.conwayApiKey)) {
-    if (!config.conwayApiKey) {
-      throw new Error("AETHERNET_PROVIDER=conway requires CONWAY_API_KEY");
+function resolveProvider(config: AgentConfig) {
+  const provider = (process.env.AETHERNET_PROVIDER ?? config.providerName).trim().toLowerCase();
+  if (provider === "api") {
+    if (!config.providerApiKey) {
+      throw new Error("AETHERNET_PROVIDER=api requires AETHERNET_PROVIDER_API_KEY");
     }
-    return new ConwayComputeProvider({
-      apiUrl: config.conwayApiUrl,
-      apiKey: config.conwayApiKey,
+    return new ApiComputeProvider({
+      apiUrl: config.providerApiUrl,
+      apiKey: config.providerApiKey,
     });
   }
 
@@ -604,7 +770,7 @@ function resolveProvider(config: ReturnType<typeof loadConfig>) {
 }
 
 function resolveMessagingTransport(
-  config: ReturnType<typeof loadConfig>,
+  config: AgentConfig,
   account?: { address: HexAddress; signMessage(input: { message: string }): Promise<string> },
 ) {
   const signer =
@@ -632,7 +798,7 @@ function resolveMessagingTransport(
   });
 }
 
-function resolveChainProfile(config: ReturnType<typeof loadConfig>, value?: string): ReturnType<typeof findChainProfile> {
+function resolveChainProfile(config: AgentConfig, value?: string): ReturnType<typeof findChainProfile> {
   if (!value) {
     return findChainProfile(config.chainDefault, config.chainProfiles);
   }
@@ -669,6 +835,34 @@ function getOption(args: string[], key: string): string | undefined {
   return args[idx + 1];
 }
 
+function fsExistsSafe(filePath: string): boolean {
+  try {
+    return fs.existsSync(filePath);
+  } catch {
+    return false;
+  }
+}
+
+function safeParseJson(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function loadConfigOrDefault(fallback: AgentConfig): AgentConfig {
+  try {
+    return loadConfig();
+  } catch {
+    return fallback;
+  }
+}
+
 function printHelp(): void {
   console.log(`
 aethernet commands:
@@ -692,6 +886,14 @@ aethernet commands:
   aethernet msg send --to <addr|inboxId> --content <text> [--thread-id <id>]
   aethernet msg poll [--limit <n>] [--since <iso-time>]
   aethernet msg threads [--limit <n>]
+  aethernet skills list
+  aethernet skills enable <id>
+  aethernet skills disable <id>
+  aethernet memory facts [--limit <n>]
+  aethernet memory episodes [--limit <n>]
+  aethernet tools sources
+  aethernet tools invoke --source <id> --tool <name> [--input <json>]
+  aethernet config validate
   aethernet replicate spawn [--name <name>] [--genesis <prompt>] [--funding <usdc>]
   aethernet replicate status
   aethernet replicate stop <childId|sandboxId>

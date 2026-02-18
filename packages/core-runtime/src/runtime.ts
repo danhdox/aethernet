@@ -5,10 +5,19 @@ import type {
   AgentConfig,
   AgentMessage,
   AgentStatus,
+  BrainAction,
+  BrainProvider,
+  BrainTurnInput,
+  BrainTurnOutput,
   ComputeProvider,
   MessagingTransport,
   ReplicationPlan,
+  RuntimeIncidentCode,
+  SkillRecord,
   SurvivalTier,
+  ToolInvocationRequest,
+  ToolInvocationResult,
+  ToolSourceConfig,
 } from "@aethernet/shared-types";
 import { AethernetDatabase, type ChildRecord, type ChildStatus } from "@aethernet/state";
 import type { PrivateKeyAccount } from "viem";
@@ -30,11 +39,28 @@ import {
   isProtectedPath,
   verifyAndPersistConstitutionHashes,
 } from "./constitution.js";
+import { createBrainProvider } from "./brain/index.js";
+import { loadSkillRecords, ensureSkillDirectory } from "./skills/loader.js";
+import { validateBrainTurnOutput } from "./autonomy/validation.js";
+import { InternalToolAdapter } from "./tools/internal.js";
+import { ReadOnlyApiToolAdapter } from "./tools/read-only-api.js";
+import { ToolSourceRegistry } from "./tools/registry.js";
 
 const SELF_MOD_WINDOW_MS = 60 * 60 * 1000;
 const SELF_MOD_LIMIT_PER_WINDOW = 6;
 const SELF_MOD_RATE_TTL_KEY = "self_mod_timestamps_v1";
 const SELF_MOD_BACKUP_KEY_PREFIX = "self_mod_backup_v1:";
+const BRAIN_FAILURE_STREAK_KEY = "brain_failure_streak_v1";
+const ALLOWED_AUTONOMY_ACTIONS = new Set<BrainAction["type"]>([
+  "send_message",
+  "replicate",
+  "self_modify",
+  "record_fact",
+  "record_episode",
+  "invoke_tool",
+  "sleep",
+  "noop",
+]);
 
 interface InboundRuntimeCommand {
   type: "self_mod" | "replicate" | "noop";
@@ -52,6 +78,7 @@ export interface RuntimeDependencies {
   db?: AethernetDatabase;
   provider?: ComputeProvider;
   messaging?: MessagingTransport;
+  brain?: BrainProvider;
 }
 
 export class AethernetRuntime {
@@ -59,6 +86,8 @@ export class AethernetRuntime {
   readonly db: AethernetDatabase;
   private readonly provider?: ComputeProvider;
   private readonly messaging?: MessagingTransport;
+  private readonly brain: BrainProvider;
+  private readonly toolRegistry: ToolSourceRegistry;
   private account?: PrivateKeyAccount;
   private unlockedUntil: number | null = null;
   private daemonRunning = false;
@@ -69,11 +98,21 @@ export class AethernetRuntime {
     this.db = dependencies.db ?? new AethernetDatabase({ dbPath: config.dbPath });
     this.provider = dependencies.provider;
     this.messaging = dependencies.messaging;
+    this.brain = dependencies.brain ?? createBrainProvider(config.brain);
+    this.toolRegistry = new ToolSourceRegistry({
+      sources: this.buildToolSources(config.toolSources),
+      allowExternalSources: config.tooling.allowExternalSources,
+      adapters: [
+        new InternalToolAdapter(this.internalToolHandlers()),
+        new ReadOnlyApiToolAdapter(),
+      ],
+    });
   }
 
   initialize(): { address: string; walletCreated: boolean } {
     ensureRuntimeDirectories(this.config);
     ensureLawTemplates(this.config);
+    ensureSkillDirectory(this.config);
 
     this.db.runMigrations();
 
@@ -105,6 +144,12 @@ export class AethernetRuntime {
     }
     if (!this.db.getKV("self_child_id")) {
       this.db.setKV("self_child_id", `root_${crypto.randomUUID()}`);
+    }
+    if (!this.db.getKV("enabled_skill_ids")) {
+      this.db.setJsonKV("enabled_skill_ids", this.config.enabledSkillIds);
+    }
+    if (!this.db.getKV(BRAIN_FAILURE_STREAK_KEY)) {
+      this.db.setKV(BRAIN_FAILURE_STREAK_KEY, "0");
     }
 
     this.db.setAgentState("waking");
@@ -262,11 +307,10 @@ export class AethernetRuntime {
       throw new Error("Runtime halted: survival tier is dead");
     }
 
-    let output = "Runtime tick complete.";
-    const actionLog: string[] = [];
+    let output = "Autonomy turn complete.";
 
     if (input.dryRun) {
-      output = "Dry run complete: runtime safeguards and loop skeleton executed.";
+      output = "Dry run complete: runtime safeguards and autonomous loop skeleton executed.";
       this.db.insertTurn({
         state: "running",
         input: input.prompt,
@@ -288,40 +332,207 @@ export class AethernetRuntime {
     }
 
     await this.syncMessagingInbox();
+    const queueDepthAtStart = this.db.countMessages();
     const inbound = this.db.pollMessages(25);
+    const inboxMessages: AgentMessage[] = inbound.map((message) => ({
+      id: message.id,
+      from: message.sender,
+      to: message.receiver,
+      content: message.content,
+      threadId: message.threadId,
+      receivedAt: message.receivedAt,
+    }));
     for (const message of inbound) {
-      const command = parseInboundCommand(message.content);
+      this.db.markMessageProcessed(message.id);
+    }
+
+    const skills = this.listSkills();
+    const recentTurns = this.db.getRecentTurns(20);
+    const memoryFacts = this.db.listMemoryFacts(150);
+    const memoryEpisodes = this.db.listMemoryEpisodes(150);
+    const latestSurvival = this.db.getLatestSurvivalSnapshot();
+    const estimatedUsd = latestSurvival?.estimatedUsd ?? this.estimateLiquidityUsd();
+
+    const brainInput: BrainTurnInput = {
+      agent: {
+        name: this.config.name,
+        address: this.getAddress() as `0x${string}`,
+        creatorAddress: this.config.creatorAddress,
+        chain: this.config.chainDefault,
+      },
+      survivalTier,
+      estimatedUsd,
+      operatorPrompt: input.prompt,
+      inboxMessages,
+      recentTurns,
+      memory: {
+        facts: memoryFacts,
+        episodes: memoryEpisodes,
+      },
+      skills,
+      toolSources: this.toolRegistry.listSources().map((source) => ({
+        id: source.id,
+        name: source.name,
+        type: source.type,
+        enabled: source.enabled,
+      })),
+      availableActions: [
+        "send_message",
+        "replicate",
+        "self_modify",
+        "record_fact",
+        "record_episode",
+        "invoke_tool",
+        "sleep",
+        "noop",
+      ],
+    };
+
+    let brainOutput: BrainTurnOutput;
+    let brainDurationMs = 0;
+    let brainFailed = false;
+    const brainStartedAt = Date.now();
+    try {
+      brainOutput = await this.brain.generateTurn(brainInput);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.db.insertRuntimeIncident({
+        code: "BRAIN_REQUEST_FAILED",
+        severity: "error",
+        category: "brain",
+        message: `Brain generation failed: ${message}`,
+      });
+      brainOutput = {
+        summary: `Brain failure: ${message}`,
+        nextActions: [{ type: "noop", reason: "brain_failure" }],
+        integrity: "malformed",
+      };
+      brainFailed = true;
+    } finally {
+      brainDurationMs = Date.now() - brainStartedAt;
+    }
+
+    const validation = validateBrainTurnOutput(
+      brainOutput,
+      {
+        maxActions: this.config.autonomy.maxActionsPerTurn,
+        maxSleepMs: this.config.autonomy.maxSleepMs,
+      },
+      {
+        strictAllowlist: this.config.autonomy.strictActionAllowlist,
+        allowlist: ALLOWED_AUTONOMY_ACTIONS,
+      },
+    );
+    const validated = validation.output;
+
+    if (validation.malformed) {
+      brainFailed = true;
+      this.db.insertRuntimeIncident({
+        code: "BRAIN_OUTPUT_MALFORMED",
+        severity: "error",
+        category: "brain",
+        message: "Brain output failed validation; turn forced into fail-closed mode.",
+        metadata: {
+          validationErrors: validation.errors,
+        },
+      });
+    }
+
+    const brainFailureStreak = brainFailed ? this.incrementBrainFailureStreak() : this.resetBrainFailureStreak();
+    if (brainFailureStreak >= this.config.autonomy.maxBrainFailuresBeforeStop) {
+      this.db.insertRuntimeIncident({
+        code: "BRAIN_REQUEST_FAILED",
+        severity: "critical",
+        category: "brain",
+        message: `Brain failure streak threshold reached (${brainFailureStreak}/${this.config.autonomy.maxBrainFailuresBeforeStop}).`,
+      });
+      throw new Error("Brain failure threshold reached; daemon entering fail-safe stop.");
+    }
+
+    const executableActions = validation.malformed
+      ? [{ type: "noop", reason: "malformed_output" } as BrainAction]
+      : validated.nextActions;
+
+    const actionLog: string[] = [];
+    let actionFailures = 0;
+    for (const action of executableActions) {
       try {
-        const actionResult = await this.applyInboundCommand(command);
-        if (actionResult) {
-          actionLog.push(actionResult);
-        }
+        const result = await this.executeBrainAction(action);
+        actionLog.push(result);
       } catch (error) {
-        actionLog.push(
-          `message ${message.id} processing failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      } finally {
-        this.db.markMessageProcessed(message.id);
+        const message = error instanceof Error ? error.message : String(error);
+        actionFailures += 1;
+        const code = this.actionFailureCode(action.type, message);
+        this.db.insertRuntimeIncident({
+          code,
+          severity: "warning",
+          category: "action",
+          message,
+          metadata: {
+            actionType: action.type,
+          },
+        });
+        actionLog.push(`action ${action.type} failed: ${message}`);
       }
     }
 
-    if (input.prompt?.trim()) {
-      actionLog.push(`operator prompt observed`);
+    if (!validation.malformed && validated.memoryWrites?.facts?.length) {
+      for (const fact of validated.memoryWrites.facts) {
+        this.db.upsertMemoryFact(fact);
+      }
     }
 
-    output = `Runtime tick complete. Inbound messages processed: ${inbound.length}. Actions taken: ${actionLog.length}.`;
+    if (!validation.malformed && validated.memoryWrites?.episodes?.length) {
+      for (const episode of validated.memoryWrites.episodes) {
+        this.db.insertMemoryEpisode(episode);
+      }
+    }
 
-    this.db.insertTurn({
+    this.db.insertMemoryEpisode({
+      summary: validated.summary,
+      actionType: actionLog.length ? "autonomy_turn" : "autonomy_idle",
+      metadata: {
+        inboundMessages: inboxMessages.length,
+        actions: actionLog,
+      },
+    });
+
+    const nextSleepMs = validated.sleepMs ?? this.config.autonomy.defaultIntervalMs;
+    this.db.setKV("autonomy_next_sleep_ms", String(nextSleepMs));
+    output = `Autonomy turn complete. Summary: ${validated.summary}. Actions: ${actionLog.length}. Inbound: ${inboxMessages.length}.`;
+
+    const turnId = this.db.insertTurn({
       state: "running",
       input: input.prompt,
       output,
       metadata: {
         dryRun: false,
-        inboundMessageCount: inbound.length,
+        inboundMessageCount: inboxMessages.length,
         actionCount: actionLog.length,
+        actionFailureCount: actionFailures,
         actions: actionLog,
+        summary: validated.summary,
+        queueDepth: queueDepthAtStart,
+        brainDurationMs,
+        brainMalformed: validation.malformed,
+        brainFailureStreak,
+        skills: skills.map((skill) => ({ id: skill.id, enabled: skill.enabled })),
+      },
+    });
+
+    this.db.insertTurnTelemetry({
+      turnId,
+      survivalTier,
+      estimatedUsd,
+      queueDepth: queueDepthAtStart,
+      spendProxyUsd: estimatedUsd,
+      actionsTotal: executableActions.length,
+      actionFailures,
+      brainDurationMs,
+      brainFailures: brainFailureStreak,
+      metadata: {
+        inboundMessageCount: inboxMessages.length,
+        summary: validated.summary,
       },
     });
 
@@ -329,7 +540,14 @@ export class AethernetRuntime {
       timestamp: new Date().toISOString(),
       category: "runtime",
       action: "run_tick",
-      details: `messages=${inbound.length} actions=${actionLog.length}`,
+      details: `messages=${inboxMessages.length} actions=${actionLog.length} actionFailures=${actionFailures}`,
+    });
+
+    await this.evaluateAndRouteAlerts({
+      survivalTier,
+      queueDepth: queueDepthAtStart,
+      brainFailureStreak,
+      actionFailures,
     });
 
     this.db.setAgentState("sleeping");
@@ -436,6 +654,50 @@ export class AethernetRuntime {
     }
 
     return dbThreads;
+  }
+
+  listSkills(): SkillRecord[] {
+    this.ensureInitialized();
+    return loadSkillRecords(this.config, this.getEnabledSkillIds());
+  }
+
+  listToolSources(): ToolSourceConfig[] {
+    this.ensureInitialized();
+    return this.toolRegistry.listSources();
+  }
+
+  async invokeTool(request: ToolInvocationRequest): Promise<ToolInvocationResult> {
+    this.ensureInitialized();
+    return this.toolRegistry.invoke(request);
+  }
+
+  setSkillEnabled(skillId: string, enabled: boolean): { id: string; enabled: boolean } {
+    this.ensureInitialized();
+    const current = this.getEnabledSkillIds();
+    const set = new Set(current);
+    if (enabled) {
+      set.add(skillId);
+    } else {
+      set.delete(skillId);
+    }
+    this.db.setJsonKV("enabled_skill_ids", Array.from(set));
+    this.db.insertAudit({
+      timestamp: new Date().toISOString(),
+      category: "runtime",
+      action: "skill_toggle",
+      details: `${skillId}:${enabled ? "enabled" : "disabled"}`,
+    });
+    return { id: skillId, enabled };
+  }
+
+  listMemoryFacts(limit = 200) {
+    this.ensureInitialized();
+    return this.db.listMemoryFacts(limit);
+  }
+
+  listMemoryEpisodes(limit = 200) {
+    this.ensureInitialized();
+    return this.db.listMemoryEpisodes(limit);
   }
 
   getChild(identifier: string): ChildRecord | null {
@@ -709,6 +971,7 @@ export class AethernetRuntime {
         });
       } catch (error) {
         this.db.insertRuntimeIncident({
+          code: "ACTION_FAILED",
           severity: "warning",
           category: "replication",
           message: `Failed to deliver parent-child XMTP bootstrap message: ${error instanceof Error ? error.message : String(error)}`,
@@ -736,7 +999,8 @@ export class AethernetRuntime {
     onTick?: (output: string) => void;
   } = {}): Promise<void> {
     this.ensureInitialized();
-    const intervalMs = input.intervalMs ?? this.config.heartbeatIntervalMs;
+    const intervalMs = input.intervalMs ?? this.config.autonomy.defaultIntervalMs ?? this.config.heartbeatIntervalMs;
+    let consecutiveErrors = 0;
     this.daemonRunning = true;
     this.db.insertAudit({
       timestamp: new Date().toISOString(),
@@ -753,24 +1017,31 @@ export class AethernetRuntime {
 
       try {
         const output = await this.run();
+        consecutiveErrors = 0;
         this.db.updateHeartbeatRun(heartbeatId, "completed", output);
         input.onTick?.(output);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        consecutiveErrors += 1;
         this.db.updateHeartbeatRun(heartbeatId, "failed", message);
         const deadState = message.includes("survival tier is dead");
         this.db.insertRuntimeIncident({
+          code: deadState ? "DAEMON_FAILURE" : "DAEMON_FAILURE",
           severity: deadState ? "critical" : "warning",
           category: "daemon",
-          message,
+          message: `${message} (consecutiveErrors=${consecutiveErrors})`,
         });
-        if (deadState) {
+        if (deadState || consecutiveErrors >= this.config.autonomy.maxConsecutiveErrors) {
           this.daemonRunning = false;
-          this.db.setAgentState("dead");
+          this.db.setAgentState(deadState ? "dead" : "stopped");
         }
       }
 
-      await sleep(intervalMs);
+      const requestedSleep = Number(this.db.getKV("autonomy_next_sleep_ms") ?? intervalMs);
+      const nextSleep = Number.isFinite(requestedSleep) && requestedSleep > 0
+        ? Math.min(Math.floor(requestedSleep), this.config.autonomy.maxSleepMs)
+        : intervalMs;
+      await sleep(nextSleep);
     }
 
     this.db.insertAudit({
@@ -816,6 +1087,129 @@ export class AethernetRuntime {
     });
   }
 
+  private async executeBrainAction(action: BrainAction): Promise<string> {
+    this.assertActionAllowlisted(action.type);
+    const params = action.params ?? {};
+
+    if (action.type === "send_message") {
+      this.assertActionChainCapability({}, "messaging", "send_message");
+      if (!this.isWalletUnlocked()) {
+        throw new Error("Wallet is locked. Unlock before autonomous send_message actions.");
+      }
+      const to = typeof params.to === "string" ? params.to : "";
+      const content = typeof params.content === "string" ? params.content : "";
+      const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
+      if (!to || !content) {
+        throw new Error("send_message requires string params.to and params.content");
+      }
+      const result = await this.sendMessage({ to, content, threadId });
+      return `send_message:${result.id}`;
+    }
+
+    if (action.type === "replicate") {
+      const initialFundingUsdc =
+        typeof params.initialFundingUsdc === "string" ? params.initialFundingUsdc : "0";
+      if (Number(initialFundingUsdc) > 0) {
+        this.assertActionChainCapability({}, "payments", "replicate");
+      } else {
+        this.assertActionChainSupported({}, "replicate");
+      }
+      if (!this.isWalletUnlocked()) {
+        throw new Error("Wallet is locked. Unlock before autonomous replication.");
+      }
+      const name = typeof params.name === "string" ? params.name : "aethernet-child";
+      const genesisPrompt =
+        typeof params.genesisPrompt === "string"
+          ? params.genesisPrompt
+          : "You are a sovereign child runtime. Operate under immutable laws and earn your existence.";
+      const result = await this.replicate({
+        name,
+        genesisPrompt,
+        creatorAddress: this.config.creatorAddress,
+        parentAddress: this.getAddress() as `0x${string}`,
+        initialFundingUsdc,
+      });
+      return `replicate:${result.sandboxId}`;
+    }
+
+    if (action.type === "self_modify") {
+      if (!this.config.autonomy.allowSelfModifyAction) {
+        throw new Error("self_modify action is disabled by autonomy policy.");
+      }
+      const targetPath = typeof params.targetPath === "string" ? params.targetPath : "";
+      const content = typeof params.content === "string" ? params.content : "";
+      if (!targetPath || !content) {
+        throw new Error("self_modify requires string params.targetPath and params.content");
+      }
+      this.selfModify(targetPath, content);
+      return `self_modify:${targetPath}`;
+    }
+
+    if (action.type === "record_fact") {
+      const key = typeof params.key === "string" ? params.key : "";
+      const value = typeof params.value === "string" ? params.value : "";
+      if (!key || !value) {
+        throw new Error("record_fact requires string params.key and params.value");
+      }
+      this.db.upsertMemoryFact({
+        key,
+        value,
+        confidence: Number.isFinite(Number(params.confidence))
+          ? Number(params.confidence)
+          : undefined,
+        source: typeof params.source === "string" ? params.source : "brain_action",
+      });
+      return `record_fact:${key}`;
+    }
+
+    if (action.type === "record_episode") {
+      const summary = typeof params.summary === "string" ? params.summary : "";
+      if (!summary) {
+        throw new Error("record_episode requires string params.summary");
+      }
+      this.db.insertMemoryEpisode({
+        summary,
+        outcome: typeof params.outcome === "string" ? params.outcome : undefined,
+        actionType: typeof params.actionType === "string" ? params.actionType : "brain_action",
+      });
+      return "record_episode";
+    }
+
+    if (action.type === "invoke_tool") {
+      const sourceId = typeof params.sourceId === "string" ? params.sourceId : "";
+      const toolName = typeof params.toolName === "string" ? params.toolName : "";
+      const toolInput = isRecord(params.input) ? params.input : {};
+      if (!sourceId || !toolName) {
+        throw new Error("invoke_tool requires string params.sourceId and params.toolName");
+      }
+      const result = await this.invokeTool({
+        sourceId,
+        toolName,
+        input: toolInput,
+      });
+      if (!result.ok) {
+        throw new Error(`invoke_tool failed for ${sourceId}/${toolName}: ${result.error ?? "unknown error"}`);
+      }
+      return `invoke_tool:${sourceId}/${toolName}`;
+    }
+
+    if (action.type === "sleep") {
+      const requested = Number(params.sleepMs ?? params.durationMs);
+      if (Number.isFinite(requested) && requested > 0) {
+        const bounded = Math.min(requested, this.config.autonomy.maxSleepMs);
+        this.db.setKV("autonomy_next_sleep_ms", String(Math.floor(bounded)));
+        return `sleep:${Math.floor(bounded)}`;
+      }
+      return "sleep:default";
+    }
+
+    if (action.type === "noop") {
+      return `noop:${action.reason ?? "none"}`;
+    }
+
+    throw new Error(`Unsupported action type: ${action.type}`);
+  }
+
   private async applyInboundCommand(command: InboundRuntimeCommand | null): Promise<string | null> {
     if (!command || command.type === "noop") {
       return null;
@@ -858,6 +1252,241 @@ export class AethernetRuntime {
     const latestSurvival = this.db.getLatestSurvivalSnapshot();
     if (latestSurvival?.tier === "dead") {
       throw new Error(`Cannot perform ${operation} while runtime is in dead tier`);
+    }
+  }
+
+  private buildToolSources(configured: ToolSourceConfig[]): ToolSourceConfig[] {
+    const base: ToolSourceConfig[] = [
+      {
+        id: "internal.runtime",
+        name: "Runtime Internal",
+        type: "internal",
+        enabled: true,
+        metadata: {
+          adapter: "internal",
+          mode: "read-only",
+        },
+      },
+    ];
+
+    const byId = new Map<string, ToolSourceConfig>();
+    for (const source of [...base, ...configured]) {
+      byId.set(source.id, source);
+    }
+    return Array.from(byId.values());
+  }
+
+  private internalToolHandlers(): Record<string, (request: ToolInvocationRequest) => Promise<ToolInvocationResult> | ToolInvocationResult> {
+    return {
+      "agent.status": async () => ({
+        ok: true,
+        output: this.status(),
+      }),
+      "memory.facts": async (request) => ({
+        ok: true,
+        output: this.listMemoryFacts(toNumber(request.input.limit, 50)),
+      }),
+      "memory.episodes": async (request) => ({
+        ok: true,
+        output: this.listMemoryEpisodes(toNumber(request.input.limit, 50)),
+      }),
+      "messages.threads": async (request) => ({
+        ok: true,
+        output: await this.listMessageThreads(toNumber(request.input.limit, 20)),
+      }),
+      "survival.latest": async () => ({
+        ok: true,
+        output: this.db.getLatestSurvivalSnapshot(),
+      }),
+      "queue.depth": async () => ({
+        ok: true,
+        output: {
+          queuedMessages: this.db.countMessages(),
+        },
+      }),
+    };
+  }
+
+  private assertActionAllowlisted(actionType: BrainAction["type"]): void {
+    if (!this.config.autonomy.strictActionAllowlist) {
+      return;
+    }
+    if (ALLOWED_AUTONOMY_ACTIONS.has(actionType)) {
+      return;
+    }
+    throw new Error(`Action ${actionType} is not in the autonomy allowlist.`);
+  }
+
+  private assertActionChainSupported(params: Record<string, unknown>, actionType: string): void {
+    this.resolveActionChain(params, actionType);
+  }
+
+  private assertActionChainCapability(
+    params: Record<string, unknown>,
+    capability: "identity" | "reputation" | "payments" | "auth" | "messaging",
+    actionType: string,
+  ): void {
+    const chain = this.resolveActionChain(params, actionType);
+    if (chain.supports?.[capability] === false) {
+      throw new Error(`Chain capability blocked for ${actionType}: ${chain.caip2} does not support ${capability}.`);
+    }
+  }
+
+  private resolveActionChain(
+    params: Record<string, unknown>,
+    actionType: string,
+  ) {
+    const requested = params.chain ?? params.network ?? params.caip2 ?? this.config.chainDefault;
+    const chainKey = typeof requested === "string" ? requested : String(requested);
+    const chain = this.config.chainProfiles.find((profile) => (
+      profile.caip2 === chainKey
+      || String(profile.chainId) === chainKey
+      || profile.name.toLowerCase() === chainKey.toLowerCase()
+    ));
+    if (!chain) {
+      throw new Error(`Action ${actionType} requested unsupported chain: ${chainKey}.`);
+    }
+    return chain;
+  }
+
+  private actionFailureCode(actionType: BrainAction["type"], message: string): RuntimeIncidentCode {
+    if (message.includes("Wallet is locked")) {
+      return "WALLET_LOCKED";
+    }
+    if (message.includes("unsupported chain") || message.includes("does not support")) {
+      return "CHAIN_CAPABILITY_BLOCKED";
+    }
+    if (message.includes("allowlist") || message.includes("disabled by autonomy policy")) {
+      return "ACTION_BLOCKED";
+    }
+    if (actionType === "self_modify" && message.includes("denied")) {
+      return "SECURITY_POLICY_VIOLATION";
+    }
+    return "ACTION_FAILED";
+  }
+
+  private incrementBrainFailureStreak(): number {
+    const current = Number(this.db.getKV(BRAIN_FAILURE_STREAK_KEY) ?? "0");
+    const next = Number.isFinite(current) ? current + 1 : 1;
+    this.db.setKV(BRAIN_FAILURE_STREAK_KEY, String(next));
+    return next;
+  }
+
+  private resetBrainFailureStreak(): number {
+    this.db.setKV(BRAIN_FAILURE_STREAK_KEY, "0");
+    return 0;
+  }
+
+  private async evaluateAndRouteAlerts(input: {
+    survivalTier: SurvivalTier;
+    queueDepth: number;
+    brainFailureStreak: number;
+    actionFailures: number;
+  }): Promise<void> {
+    if (!this.config.alerting.enabled) {
+      return;
+    }
+
+    const windowStart = Date.now() - (this.config.alerting.evaluationWindowMinutes * 60_000);
+    const incidents = this.db
+      .listRuntimeIncidents(500)
+      .filter((incident) => Date.parse(incident.timestamp) >= windowStart);
+    const criticalCount = incidents.filter((incident) => incident.severity === "critical").length;
+
+    const alertCandidates: Array<{
+      code: RuntimeIncidentCode;
+      severity: "warning" | "critical";
+      message: string;
+      metadata: Record<string, unknown>;
+    }> = [];
+
+    if (input.survivalTier === "dead") {
+      alertCandidates.push({
+        code: "ALERT_TRIGGERED",
+        severity: "critical",
+        message: "Survival tier reached dead state.",
+        metadata: { survivalTier: input.survivalTier },
+      });
+    }
+
+    if (criticalCount >= this.config.alerting.criticalIncidentThreshold) {
+      alertCandidates.push({
+        code: "ALERT_TRIGGERED",
+        severity: "critical",
+        message: `Critical incident threshold exceeded (${criticalCount}/${this.config.alerting.criticalIncidentThreshold}).`,
+        metadata: { criticalCount, evaluationWindowMinutes: this.config.alerting.evaluationWindowMinutes },
+      });
+    }
+
+    if (input.brainFailureStreak >= this.config.alerting.brainFailureThreshold) {
+      alertCandidates.push({
+        code: "ALERT_TRIGGERED",
+        severity: "critical",
+        message: `Brain failure streak threshold exceeded (${input.brainFailureStreak}/${this.config.alerting.brainFailureThreshold}).`,
+        metadata: { brainFailureStreak: input.brainFailureStreak },
+      });
+    }
+
+    if (input.queueDepth >= this.config.alerting.queueDepthThreshold) {
+      alertCandidates.push({
+        code: "ALERT_TRIGGERED",
+        severity: "warning",
+        message: `Queue depth threshold exceeded (${input.queueDepth}/${this.config.alerting.queueDepthThreshold}).`,
+        metadata: { queueDepth: input.queueDepth, actionFailures: input.actionFailures },
+      });
+    }
+
+    for (const candidate of alertCandidates) {
+      const markerKey = `alert:last:${candidate.severity}:${candidate.message}`;
+      const last = Number(this.db.getKV(markerKey) ?? "0");
+      if (Number.isFinite(last) && Date.now() - last < 60_000) {
+        continue;
+      }
+      this.db.setKV(markerKey, String(Date.now()));
+      this.db.insertAlertEvent({
+        code: candidate.code,
+        severity: candidate.severity,
+        route: this.config.alerting.route,
+        message: candidate.message,
+        metadata: candidate.metadata,
+      });
+      this.db.insertRuntimeIncident({
+        code: candidate.code,
+        severity: candidate.severity,
+        category: "alert",
+        message: candidate.message,
+        metadata: candidate.metadata,
+      });
+
+      if (this.config.alerting.route === "stdout") {
+        const line = `[ALERT][${candidate.severity}] ${candidate.message}`;
+        if (candidate.severity === "critical") {
+          console.error(line);
+        } else {
+          console.warn(line);
+        }
+      } else if (this.config.alerting.route === "webhook" && this.config.alerting.webhookUrl) {
+        try {
+          await fetch(this.config.alerting.webhookUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              code: candidate.code,
+              severity: candidate.severity,
+              message: candidate.message,
+              metadata: candidate.metadata,
+              timestamp: new Date().toISOString(),
+            }),
+          });
+        } catch (error) {
+          this.db.insertRuntimeIncident({
+            code: "PROVIDER_FAILURE",
+            severity: "warning",
+            category: "alert",
+            message: `Alert webhook delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+      }
     }
   }
 
@@ -906,6 +1535,14 @@ export class AethernetRuntime {
     }
 
     return value.filter((entry) => Number.isFinite(entry));
+  }
+
+  private getEnabledSkillIds(): string[] {
+    const value = this.db.getJsonKV<string[]>("enabled_skill_ids");
+    if (!Array.isArray(value) || value.length === 0) {
+      return this.config.enabledSkillIds;
+    }
+    return value.filter((entry) => typeof entry === "string" && entry.trim().length > 0);
   }
 
   private ensureInitialized(): void {
@@ -995,6 +1632,18 @@ function hashFileSafe(targetPath: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function toNumber(value: unknown, fallback: number): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(1, Math.floor(numeric));
 }
 
 function parseInboundCommand(input: string): InboundRuntimeCommand | null {

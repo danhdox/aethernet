@@ -10,6 +10,7 @@ const KDF_KEY_LEN = 32;
 const SALT_LEN = 16;
 const IV_LEN = 12;
 const TAG_LEN = 16;
+const MIN_PASSPHRASE_LENGTH = 12;
 
 interface LegacyWalletData {
   privateKey: `0x${string}`;
@@ -131,6 +132,10 @@ export function rotateWalletPassphrase(
   oldPassphrase: string,
   newPassphrase: string,
 ): WalletKeystoreMeta {
+  if (oldPassphrase === newPassphrase) {
+    throw new Error("New wallet passphrase must differ from the old passphrase.");
+  }
+  assertPassphraseStrength(newPassphrase);
   const account = decryptWalletAccount(config, oldPassphrase);
   const privateKey = decryptWalletPrivateKey(config, oldPassphrase);
   const encrypted = readEncryptedWallet(config);
@@ -141,6 +146,32 @@ export function rotateWalletPassphrase(
     encrypted.createdAt,
     newPassphrase,
   );
+  return readWalletMeta(config);
+}
+
+export function importWalletPrivateKey(
+  config: AgentConfig,
+  privateKey: `0x${string}`,
+  passphrase: string,
+  options: { allowOverwrite?: boolean } = {},
+): WalletKeystoreMeta {
+  if (!options.allowOverwrite && walletExists(config)) {
+    throw new Error("A wallet already exists. Rotate passphrase or remove existing wallet before importing.");
+  }
+  if (!privateKey.startsWith("0x") || privateKey.length !== 66) {
+    throw new Error("Invalid private key format. Expected 32-byte 0x-prefixed hex string.");
+  }
+  assertPassphraseStrength(passphrase);
+
+  const account = privateKeyToAccount(privateKey);
+  writeEncryptedWallet(
+    config,
+    privateKey,
+    account.address,
+    new Date().toISOString(),
+    passphrase,
+  );
+
   return readWalletMeta(config);
 }
 
@@ -179,9 +210,7 @@ function writeEncryptedWallet(
   createdAt: string,
   passphrase: string,
 ): void {
-  if (!passphrase.trim()) {
-    throw new Error("Wallet passphrase cannot be empty");
-  }
+  assertPassphraseStrength(passphrase);
 
   const salt = crypto.randomBytes(SALT_LEN);
   const iv = crypto.randomBytes(IV_LEN);
@@ -237,4 +266,23 @@ function decryptPrivateKey(
 function decryptWalletPrivateKey(config: AgentConfig, passphrase: string): `0x${string}` {
   const encrypted = readEncryptedWallet(config);
   return decryptPrivateKey(encrypted, passphrase);
+}
+
+function assertPassphraseStrength(passphrase: string): void {
+  if (!passphrase.trim()) {
+    throw new Error("Wallet passphrase cannot be empty.");
+  }
+  if (passphrase.length < MIN_PASSPHRASE_LENGTH) {
+    throw new Error(`Wallet passphrase must be at least ${MIN_PASSPHRASE_LENGTH} characters.`);
+  }
+
+  const classes = [
+    /[a-z]/.test(passphrase),
+    /[A-Z]/.test(passphrase),
+    /[0-9]/.test(passphrase),
+    /[^A-Za-z0-9]/.test(passphrase),
+  ].filter(Boolean).length;
+  if (classes < 3) {
+    throw new Error("Wallet passphrase must include at least 3 character classes (lower, upper, number, symbol).");
+  }
 }

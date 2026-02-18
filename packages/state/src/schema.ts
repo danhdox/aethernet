@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 4;
 
 export const CREATE_BASE_TABLES = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -207,11 +207,55 @@ CREATE TABLE IF NOT EXISTS provider_events (
 
 CREATE TABLE IF NOT EXISTS runtime_incidents (
   id TEXT PRIMARY KEY,
+  code TEXT NOT NULL DEFAULT 'ACTION_FAILED',
   severity TEXT NOT NULL,
   category TEXT NOT NULL,
   message TEXT NOT NULL,
   metadata TEXT NOT NULL DEFAULT '{}',
   timestamp TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runtime_alerts (
+  id TEXT PRIMARY KEY,
+  code TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  route TEXT NOT NULL,
+  message TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  timestamp TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runtime_turn_telemetry (
+  id TEXT PRIMARY KEY,
+  turn_id TEXT NOT NULL,
+  survival_tier TEXT NOT NULL,
+  estimated_usd REAL NOT NULL,
+  queue_depth INTEGER NOT NULL,
+  spend_proxy_usd REAL NOT NULL,
+  actions_total INTEGER NOT NULL,
+  action_failures INTEGER NOT NULL,
+  brain_duration_ms INTEGER NOT NULL,
+  brain_failures INTEGER NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_facts (
+  id TEXT PRIMARY KEY,
+  key TEXT NOT NULL UNIQUE,
+  value TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0.5,
+  source TEXT NOT NULL DEFAULT 'runtime',
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_episodes (
+  id TEXT PRIMARY KEY,
+  summary TEXT NOT NULL,
+  outcome TEXT,
+  action_type TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
 );
 
 INSERT OR IGNORE INTO emergency_state(id, enabled, reason) VALUES (1, 0, NULL);
@@ -230,4 +274,10 @@ CREATE INDEX IF NOT EXISTS idx_survival_snapshots_timestamp ON survival_snapshot
 CREATE INDEX IF NOT EXISTS idx_heartbeat_runs_task ON heartbeat_runs(task_name);
 CREATE INDEX IF NOT EXISTS idx_provider_events_timestamp ON provider_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_runtime_incidents_timestamp ON runtime_incidents(timestamp);
+CREATE INDEX IF NOT EXISTS idx_runtime_incidents_code ON runtime_incidents(code);
+CREATE INDEX IF NOT EXISTS idx_runtime_alerts_timestamp ON runtime_alerts(timestamp);
+CREATE INDEX IF NOT EXISTS idx_runtime_alerts_code ON runtime_alerts(code);
+CREATE INDEX IF NOT EXISTS idx_memory_facts_updated ON memory_facts(updated_at);
+CREATE INDEX IF NOT EXISTS idx_memory_episodes_created ON memory_episodes(created_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_turn_telemetry_created ON runtime_turn_telemetry(created_at);
 `;

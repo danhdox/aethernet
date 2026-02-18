@@ -9,9 +9,19 @@ import type {
   AuthNonceRecord,
   ChildLineageRecord,
   HexAddress,
+  MemoryEpisode,
+  MemoryEpisodeWrite,
+  MemoryFact,
+  MemoryFactWrite,
+  RuntimeAlertRecord,
+  RuntimeIncidentCode,
+  RuntimeIncidentRecord,
+  RuntimeIncidentSeverity,
   RollbackPoint,
   SelfModMutation,
+  SurvivalTier,
   SurvivalSnapshot,
+  TurnTelemetryRecord,
   WalletKeystoreMeta,
   XmtpConversationRef,
   XmtpConsentState,
@@ -68,6 +78,11 @@ export class AethernetDatabase {
       .get() as { version?: number };
 
     const currentVersion = current.version ?? 0;
+
+    if (currentVersion < 4) {
+      this.ensureRuntimeIncidentCodeColumn();
+    }
+
     if (currentVersion >= SCHEMA_VERSION) {
       return;
     }
@@ -81,6 +96,16 @@ export class AethernetDatabase {
     });
 
     tx();
+  }
+
+  private ensureRuntimeIncidentCodeColumn(): void {
+    const columns = this.db
+      .prepare("PRAGMA table_info(runtime_incidents)")
+      .all() as Array<{ name: string }>;
+    const hasCode = columns.some((column) => column.name === "code");
+    if (!hasCode) {
+      this.db.exec("ALTER TABLE runtime_incidents ADD COLUMN code TEXT NOT NULL DEFAULT 'ACTION_FAILED'");
+    }
   }
 
   close(): void {
@@ -169,7 +194,7 @@ export class AethernetDatabase {
         `INSERT INTO audit_entries(id, timestamp, category, action, details)
          VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(id, entry.timestamp, entry.category, entry.action, entry.details ?? null);
+      .run(id, entry.timestamp, entry.category, entry.action, redactText(entry.details) ?? null);
     return id;
   }
 
@@ -202,9 +227,9 @@ export class AethernetDatabase {
         id,
         input.timestamp ?? new Date().toISOString(),
         input.state,
-        input.input ?? null,
-        input.output ?? null,
-        JSON.stringify(input.metadata ?? {}),
+        redactText(input.input) ?? null,
+        redactText(input.output) ?? null,
+        JSON.stringify(redactUnknown(input.metadata ?? {})),
       );
     return id;
   }
@@ -364,7 +389,7 @@ export class AethernetDatabase {
         input.amount,
         input.asset,
         input.txHash ?? null,
-        JSON.stringify(input.metadata ?? {}),
+        JSON.stringify(redactUnknown(input.metadata ?? {})),
       );
 
     return id;
@@ -1207,7 +1232,7 @@ export class AethernetDatabase {
         id,
         input.provider,
         input.event,
-        JSON.stringify(input.metadata ?? {}),
+        JSON.stringify(redactUnknown(input.metadata ?? {})),
         input.timestamp ?? new Date().toISOString(),
       );
     return id;
@@ -1242,7 +1267,8 @@ export class AethernetDatabase {
 
   insertRuntimeIncident(input: {
     id?: string;
-    severity: "info" | "warning" | "error" | "critical";
+    code: RuntimeIncidentCode;
+    severity: RuntimeIncidentSeverity;
     category: string;
     message: string;
     metadata?: Record<string, unknown>;
@@ -1251,38 +1277,32 @@ export class AethernetDatabase {
     const id = input.id ?? ulid();
     this.db
       .prepare(
-        `INSERT INTO runtime_incidents(id, severity, category, message, metadata, timestamp)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runtime_incidents(id, code, severity, category, message, metadata, timestamp)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
+        input.code,
         input.severity,
         input.category,
-        input.message,
-        JSON.stringify(input.metadata ?? {}),
+        redactText(input.message) ?? "runtime incident",
+        JSON.stringify(redactUnknown(input.metadata ?? {})),
         input.timestamp ?? new Date().toISOString(),
       );
     return id;
   }
 
-  listRuntimeIncidents(limit = 100): Array<{
-    id: string;
-    severity: string;
-    category: string;
-    message: string;
-    metadata: Record<string, unknown>;
-    timestamp: string;
-  }> {
+  listRuntimeIncidents(limit = 100): RuntimeIncidentRecord[] {
     const rows = this.db
       .prepare(
-        `SELECT id, severity, category, message, metadata, timestamp
+        `SELECT id, code, severity, category, message, metadata, timestamp
          FROM runtime_incidents
          ORDER BY timestamp DESC
          LIMIT ?`,
-      )
-      .all(limit) as Array<{
+      ).all(limit) as Array<{
       id: string;
-      severity: string;
+      code: RuntimeIncidentCode;
+      severity: RuntimeIncidentSeverity;
       category: string;
       message: string;
       metadata: string;
@@ -1293,6 +1313,201 @@ export class AethernetDatabase {
       metadata: safeParseJson(row.metadata),
     }));
   }
+
+  insertAlertEvent(input: {
+    id?: string;
+    code: RuntimeIncidentCode;
+    severity: RuntimeIncidentSeverity;
+    route: RuntimeAlertRecord["route"];
+    message: string;
+    metadata?: Record<string, unknown>;
+    timestamp?: string;
+  }): string {
+    const id = input.id ?? ulid();
+    this.db
+      .prepare(
+        `INSERT INTO runtime_alerts(id, code, severity, route, message, metadata, timestamp)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        input.code,
+        input.severity,
+        input.route,
+        redactText(input.message) ?? "runtime alert",
+        JSON.stringify(redactUnknown(input.metadata ?? {})),
+        input.timestamp ?? new Date().toISOString(),
+      );
+    return id;
+  }
+
+  listAlertEvents(limit = 100): RuntimeAlertRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, code, severity, route, message, metadata, timestamp
+         FROM runtime_alerts
+         ORDER BY timestamp DESC
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{
+      id: string;
+      code: RuntimeIncidentCode;
+      severity: RuntimeIncidentSeverity;
+      route: RuntimeAlertRecord["route"];
+      message: string;
+      metadata: string;
+      timestamp: string;
+    }>;
+
+    return rows.map((row) => ({
+      ...row,
+      metadata: safeParseJson(row.metadata),
+    }));
+  }
+
+  insertTurnTelemetry(input: {
+    id?: string;
+    turnId: string;
+    survivalTier: SurvivalTier;
+    estimatedUsd: number;
+    queueDepth: number;
+    spendProxyUsd: number;
+    actionsTotal: number;
+    actionFailures: number;
+    brainDurationMs: number;
+    brainFailures: number;
+    metadata?: Record<string, unknown>;
+    createdAt?: string;
+  }): string {
+    const id = input.id ?? ulid();
+    this.db
+      .prepare(
+        `INSERT INTO runtime_turn_telemetry(
+          id, turn_id, survival_tier, estimated_usd, queue_depth, spend_proxy_usd,
+          actions_total, action_failures, brain_duration_ms, brain_failures, metadata, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        input.turnId,
+        input.survivalTier,
+        input.estimatedUsd,
+        input.queueDepth,
+        input.spendProxyUsd,
+        input.actionsTotal,
+        input.actionFailures,
+        input.brainDurationMs,
+        input.brainFailures,
+        JSON.stringify(redactUnknown(input.metadata ?? {})),
+        input.createdAt ?? new Date().toISOString(),
+      );
+    return id;
+  }
+
+  listTurnTelemetry(limit = 200): TurnTelemetryRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT
+          id,
+          turn_id as turnId,
+          survival_tier as survivalTier,
+          estimated_usd as estimatedUsd,
+          queue_depth as queueDepth,
+          spend_proxy_usd as spendProxyUsd,
+          actions_total as actionsTotal,
+          action_failures as actionFailures,
+          brain_duration_ms as brainDurationMs,
+          brain_failures as brainFailures,
+          metadata,
+          created_at as createdAt
+        FROM runtime_turn_telemetry
+        ORDER BY created_at DESC
+        LIMIT ?`,
+      )
+      .all(limit) as Array<Omit<TurnTelemetryRecord, "metadata"> & { metadata: string }>;
+
+    return rows.map((row) => ({
+      ...row,
+      metadata: safeParseJson(row.metadata),
+    }));
+  }
+
+  upsertMemoryFact(input: MemoryFactWrite): string {
+    const id = ulid();
+    const updatedAt = new Date().toISOString();
+    const confidence = Number.isFinite(input.confidence ?? NaN) ? Number(input.confidence) : 0.5;
+    const source = input.source?.trim() || "runtime";
+    this.db
+      .prepare(
+        `INSERT INTO memory_facts(id, key, value, confidence, source, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           confidence = excluded.confidence,
+           source = excluded.source,
+           updated_at = excluded.updated_at`,
+      )
+      .run(id, input.key, input.value, confidence, source, updatedAt);
+
+    return id;
+  }
+
+  listMemoryFacts(limit = 200): MemoryFact[] {
+    return this.db
+      .prepare(
+        `SELECT id, key, value, confidence, source, updated_at as updatedAt
+         FROM memory_facts
+         ORDER BY updated_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as MemoryFact[];
+  }
+
+  insertMemoryEpisode(input: MemoryEpisodeWrite): string {
+    const id = ulid();
+    this.db
+      .prepare(
+        `INSERT INTO memory_episodes(id, summary, outcome, action_type, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        input.summary,
+        input.outcome ?? null,
+        input.actionType ?? null,
+        JSON.stringify(input.metadata ?? {}),
+        new Date().toISOString(),
+      );
+
+    return id;
+  }
+
+  listMemoryEpisodes(limit = 200): MemoryEpisode[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, summary, outcome, action_type as actionType, metadata, created_at as createdAt
+         FROM memory_episodes
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{
+      id: string;
+      summary: string;
+      outcome: string | null;
+      actionType: string | null;
+      metadata: string;
+      createdAt: string;
+    }>;
+
+    return rows.map((row) => ({
+      id: row.id,
+      summary: row.summary,
+      outcome: row.outcome,
+      actionType: row.actionType,
+      metadata: safeParseJson(row.metadata),
+      createdAt: row.createdAt,
+    }));
+  }
 }
 
 function normalizeChildStatus(value: string): ChildStatus {
@@ -1301,6 +1516,52 @@ function normalizeChildStatus(value: string): ChildStatus {
   }
 
   return "running";
+}
+
+const REDACTED = "[REDACTED]";
+const SECRET_KEY_PATTERN = /(api[_-]?key|private[_-]?key|passphrase|authorization|auth[_-]?header|secret|token|ciphertext|salt|iv|tag|signature)/i;
+const SECRET_VALUE_PATTERNS = [
+  /\bBearer\s+[A-Za-z0-9._-]+/gi,
+  /\b0x[a-fA-F0-9]{64}\b/g,
+  /(x-erc8128-signature|x-request-signature)\s*:\s*[^,\s]+/gi,
+  /(x-erc8128-nonce|x-request-nonce)\s*:\s*[^,\s]+/gi,
+];
+
+function redactUnknown(value: unknown): unknown {
+  if (typeof value === "string") {
+    return redactText(value) ?? value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactUnknown(item));
+  }
+
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const next: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(record)) {
+      if (SECRET_KEY_PATTERN.test(key)) {
+        next[key] = REDACTED;
+        continue;
+      }
+      next[key] = redactUnknown(entry);
+    }
+    return next;
+  }
+
+  return value;
+}
+
+function redactText(value?: string | null): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  let redacted = value;
+  for (const pattern of SECRET_VALUE_PATTERNS) {
+    redacted = redacted.replace(pattern, REDACTED);
+  }
+  return redacted;
 }
 
 function safeParseJson(input: string): Record<string, unknown> {

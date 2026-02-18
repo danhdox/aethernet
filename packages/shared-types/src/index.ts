@@ -208,6 +208,181 @@ export interface ProviderCapabilityMatrix {
   canGetLogs: boolean;
 }
 
+export interface ToolSourceConfig {
+  id: string;
+  name: string;
+  type: "api" | "internal" | "mcp";
+  enabled: boolean;
+  baseUrl?: string;
+  authEnv?: string;
+  metadata?: Record<string, string>;
+}
+
+export interface ToolInvocationRequest {
+  sourceId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  context?: Record<string, unknown>;
+}
+
+export interface ToolInvocationResult {
+  ok: boolean;
+  output?: unknown;
+  error?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ToolSetAdapter {
+  readonly name: string;
+  invoke(request: ToolInvocationRequest): Promise<ToolInvocationResult>;
+}
+
+export interface SkillManifest {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  enabled: boolean;
+  capabilities: string[];
+  toolSources: string[];
+}
+
+export interface SkillRecord extends SkillManifest {
+  instructions: string;
+  sourcePath?: string;
+}
+
+export interface MemoryFact {
+  id: string;
+  key: string;
+  value: string;
+  confidence: number;
+  source: string;
+  updatedAt: string;
+}
+
+export interface MemoryEpisode {
+  id: string;
+  summary: string;
+  outcome?: string | null;
+  actionType?: string | null;
+  createdAt: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface MemoryFactWrite {
+  key: string;
+  value: string;
+  confidence?: number;
+  source?: string;
+}
+
+export interface MemoryEpisodeWrite {
+  summary: string;
+  outcome?: string;
+  actionType?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface BrainConfig {
+  provider: "openai";
+  model: string;
+  apiUrl: string;
+  apiKeyEnv: string;
+  temperature: number;
+  maxOutputTokens: number;
+  timeoutMs: number;
+  maxRetries: number;
+  retryBackoffMs: number;
+}
+
+export interface BrainTurnInput {
+  agent: {
+    name: string;
+    address: HexAddress;
+    creatorAddress: HexAddress;
+    chain: Caip2Network;
+  };
+  survivalTier: SurvivalTier;
+  estimatedUsd: number;
+  operatorPrompt?: string;
+  inboxMessages: AgentMessage[];
+  recentTurns: Array<{
+    timestamp: string;
+    state: AgentState;
+    input: string | null;
+    output: string | null;
+    metadata: Record<string, unknown>;
+  }>;
+  memory: {
+    facts: MemoryFact[];
+    episodes: MemoryEpisode[];
+  };
+  skills: SkillRecord[];
+  toolSources: Array<{
+    id: string;
+    name: string;
+    type: ToolSourceConfig["type"];
+    enabled: boolean;
+  }>;
+  availableActions: string[];
+}
+
+export interface BrainAction {
+  type:
+    | "send_message"
+    | "replicate"
+    | "self_modify"
+    | "record_fact"
+    | "record_episode"
+    | "invoke_tool"
+    | "sleep"
+    | "noop";
+  reason?: string;
+  params?: Record<string, unknown>;
+}
+
+export interface BrainTurnOutput {
+  summary: string;
+  nextActions: BrainAction[];
+  memoryWrites?: {
+    facts?: MemoryFactWrite[];
+    episodes?: MemoryEpisodeWrite[];
+  };
+  sleepMs?: number;
+  integrity?: "ok" | "malformed";
+}
+
+export interface BrainProvider {
+  readonly name: string;
+  generateTurn(input: BrainTurnInput): Promise<BrainTurnOutput>;
+}
+
+export interface AutonomyConfig {
+  mode: "full_auto";
+  defaultIntervalMs: number;
+  maxActionsPerTurn: number;
+  maxConsecutiveErrors: number;
+  maxSleepMs: number;
+  maxBrainFailuresBeforeStop: number;
+  strictActionAllowlist: boolean;
+  allowSelfModifyAction: boolean;
+}
+
+export interface AlertingConfig {
+  enabled: boolean;
+  route: "db" | "stdout" | "webhook";
+  webhookUrl?: string;
+  criticalIncidentThreshold: number;
+  brainFailureThreshold: number;
+  queueDepthThreshold: number;
+  evaluationWindowMinutes: number;
+}
+
+export interface ToolingConfig {
+  allowExternalSources: boolean;
+}
+
 export interface AgentConfig {
   name: string;
   genesisPrompt: string;
@@ -218,13 +393,21 @@ export interface AgentConfig {
   configPath: string;
   chainDefault: Caip2Network;
   chainProfiles: ChainProfile[];
-  conwayApiUrl: string;
-  conwayApiKey?: string;
+  providerName: "selfhost" | "kubernetes" | "api" | "in-memory";
+  providerApiUrl: string;
+  providerApiKey?: string;
   localApiPort: number;
   maxChildren: number;
   aggressiveSelfMod: boolean;
   walletSessionTtlSec: number;
   heartbeatIntervalMs: number;
+  skillsDir: string;
+  enabledSkillIds: string[];
+  toolSources: ToolSourceConfig[];
+  tooling: ToolingConfig;
+  brain: BrainConfig;
+  autonomy: AutonomyConfig;
+  alerting: AlertingConfig;
   survival: {
     lowComputeUsd: number;
     criticalUsd: number;
@@ -314,6 +497,18 @@ export interface AgentRuntimeMetrics {
   turns: number;
   messagesTotal: number;
   queuedMessages: number;
+  lastSurvivalTier?: SurvivalTier;
+  lastEstimatedUsd?: number;
+  latestQueueDepth: number;
+  spendProxyUsd: number;
+  brain: {
+    avgDurationMs: number;
+    failures: number;
+  };
+  actions: {
+    total: number;
+    failed: number;
+  };
   paymentEvents: {
     total: number;
     inbound: number;
@@ -333,6 +528,56 @@ export interface AgentRuntimeMetrics {
     stopped: number;
     deleted: number;
   };
+}
+
+export type RuntimeIncidentSeverity = "info" | "warning" | "error" | "critical";
+
+export type RuntimeIncidentCode =
+  | "CONFIG_INVALID"
+  | "BRAIN_REQUEST_FAILED"
+  | "BRAIN_OUTPUT_MALFORMED"
+  | "ACTION_BLOCKED"
+  | "ACTION_FAILED"
+  | "CHAIN_CAPABILITY_BLOCKED"
+  | "WALLET_LOCKED"
+  | "DAEMON_FAILURE"
+  | "ALERT_TRIGGERED"
+  | "SECURITY_POLICY_VIOLATION"
+  | "PROVIDER_FAILURE";
+
+export interface RuntimeIncidentRecord {
+  id: string;
+  code: RuntimeIncidentCode;
+  severity: RuntimeIncidentSeverity;
+  category: string;
+  message: string;
+  metadata: Record<string, unknown>;
+  timestamp: string;
+}
+
+export interface RuntimeAlertRecord {
+  id: string;
+  code: RuntimeIncidentCode;
+  severity: RuntimeIncidentSeverity;
+  route: "db" | "stdout" | "webhook";
+  message: string;
+  metadata: Record<string, unknown>;
+  timestamp: string;
+}
+
+export interface TurnTelemetryRecord {
+  id: string;
+  turnId: string;
+  survivalTier: SurvivalTier;
+  estimatedUsd: number;
+  queueDepth: number;
+  spendProxyUsd: number;
+  actionsTotal: number;
+  actionFailures: number;
+  brainDurationMs: number;
+  brainFailures: number;
+  createdAt: string;
+  metadata: Record<string, unknown>;
 }
 
 export interface AuditEntry {
