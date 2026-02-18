@@ -1,0 +1,20 @@
+{
+  "provider": "api",
+  "baseUrl": "https://compute.example.com",
+  "auth": {
+    "header": "Authorization",
+    "env": "AETHERNET_PROVIDER_API_KEY"
+  },
+  "timeouts": {
+    "requestMs": 30000
+  },
+  "capabilities": [
+    "createSandbox",
+    "destroySandbox",
+    "exec",
+    "writeFile",
+    "fundWallet",
+    "getSandboxStatus",
+    "getSandboxLogs"
+  ]
+}

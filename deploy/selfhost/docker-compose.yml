@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  aethernet:
+    image: node:20-bookworm
+    working_dir: /workspace
+    command: >
+      sh -lc "corepack enable &&
+      pnpm install --frozen-lockfile &&
+      pnpm -r build &&
+      node packages/cli/dist/index.js run --daemon"
+    restart: unless-stopped
+    env_file:
+      - ../../.env.example
+    environment:
+      - AETHERNET_PROVIDER=selfhost
+      - AETHERNET_HOME=/var/lib/aethernet
+      - AETHERNET_XMTP_ENABLED=true
+    ports:
+      - "4123:4123"
+    volumes:
+      - ../../:/workspace
+      - aethernet_data:/var/lib/aethernet
+
+volumes:
+  aethernet_data:

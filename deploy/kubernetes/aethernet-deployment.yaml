@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aethernet
+  namespace: aethernet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aethernet
+  template:
+    metadata:
+      labels:
+        app: aethernet
+    spec:
+      containers:
+        - name: runtime
+          image: ghcr.io/aethernet/runtime:v1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["node", "packages/cli/dist/index.js", "run", "--daemon"]
+          envFrom:
+            - secretRef:
+                name: aethernet-secrets
+            - configMapRef:
+                name: aethernet-config
+          ports:
+            - containerPort: 4123
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /v1/agent/health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /v1/agent/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: runtime-data
+              mountPath: /var/lib/aethernet
+      volumes:
+        - name: runtime-data
+          persistentVolumeClaim:
+            claimName: aethernet-data
